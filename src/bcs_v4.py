@@ -1,58 +1,32 @@
-# src/sensors_v4.py
-import pandas as pd
-import numpy as np
+# src/bcs_v4.py
 import torch
+from src.residuals_v4 import axisym_transient_component
 
-class SensorDataset:
-    def __init__(self, meta_path, ts_path, id_col, time_col, value_col, device):
-        self.meta = pd.read_csv(meta_path)
-        self.ts = pd.read_csv(ts_path)
+def axis_symmetry_loss(model, rzt, r_eps, comp: int):
+    _, Tr, _, _, _ = axisym_transient_component(model, rzt, r_eps=r_eps, comp=comp)
+    return torch.mean(Tr**2)
 
-        self.id_col = id_col
-        self.time_col = time_col
-        self.value_col = value_col
-        self.device = device
+def radiation_bc_const_z(model, rzt, r_eps, comp, k, eps, sigma, T_env):
+    # const-z surface => normal derivative ~ dT/dz
+    T, _, Tz, _, _ = axisym_transient_component(model, rzt, r_eps=r_eps, comp=comp)
+    q_pred = -k * Tz
+    q_rad = eps * sigma * (T**4 - (T_env**4))
+    return torch.mean((q_pred - q_rad)**2)
 
-        self.sensor_ids = self.meta[id_col].tolist()
-        self.id_to_idx = {sid: i for i, sid in enumerate(self.sensor_ids)}
+def radiation_bc_const_r(model, rzt, r_eps, comp, k, eps, sigma, T_env):
+    # const-r surface => normal derivative ~ dT/dr
+    T, Tr, _, _, _ = axisym_transient_component(model, rzt, r_eps=r_eps, comp=comp)
+    q_pred = -k * Tr
+    q_rad = eps * sigma * (T**4 - (T_env**4))
+    return torch.mean((q_pred - q_rad)**2)
 
-        # positions
-        self.pos = {
-            sid: (
-                float(self.meta.loc[self.meta[id_col] == sid, "r"].iloc[0]),
-                float(self.meta.loc[self.meta[id_col] == sid, "z"].iloc[0]),
-            )
-            for sid in self.sensor_ids
-        }
+def interface_T_continuity(model, rzt, r_eps):
+    Tm, _, _, _, _ = axisym_transient_component(model, rzt, r_eps=r_eps, comp=0)
+    Ts, _, _, _, _ = axisym_transient_component(model, rzt, r_eps=r_eps, comp=1)
+    return torch.mean((Tm - Ts)**2)
 
-        # group time series by sensor id
-        self.groups = {
-            sid: g[[time_col, value_col]].to_numpy()
-            for sid, g in self.ts.groupby(id_col)
-        }
-
-    def num_sensors(self):
-        return len(self.sensor_ids)
-
-    def sample_batch(self, n_sensors, n_time_per_sensor):
-        chosen = np.random.choice(self.sensor_ids, size=min(n_sensors, len(self.sensor_ids)), replace=False)
-
-        rr, zz, tt, yy, idxs = [], [], [], [], []
-        for sid in chosen:
-            arr = self.groups.get(sid, None)
-            if arr is None or len(arr) == 0:
-                continue
-
-            pick = np.random.choice(len(arr), size=min(n_time_per_sensor, len(arr)), replace=False)
-            r, z = self.pos[sid]
-            for j in pick:
-                tval, yval = arr[j, 0], arr[j, 1]
-                rr.append(r); zz.append(z); tt.append(tval); yy.append(yval)
-                idxs.append(self.id_to_idx[sid])
-
-        r = torch.tensor(rr, dtype=torch.float32, device=self.device).reshape(-1, 1)
-        z = torch.tensor(zz, dtype=torch.float32, device=self.device).reshape(-1, 1)
-        t = torch.tensor(tt, dtype=torch.float32, device=self.device).reshape(-1, 1)
-        y = torch.tensor(yy, dtype=torch.float32, device=self.device).reshape(-1, 1)
-        sidx = torch.tensor(idxs, dtype=torch.long, device=self.device)
-        return r, z, t, y, sidx
+def interface_flux_continuity(model, rzt, r_eps, k_m, k_s):
+    # interface is const-z => enforce km*dTm/dz = ks*dTs/dz
+    _, _, Tz_m, _, _ = axisym_transient_component(model, rzt, r_eps=r_eps, comp=0)
+    _, _, Tz_s, _, _ = axisym_transient_component(model, rzt, r_eps=r_eps, comp=1)
+    return torch.mean((k_m*Tz_m - k_s*Tz_s)**2)
